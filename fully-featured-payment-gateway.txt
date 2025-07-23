@@ -1,0 +1,231 @@
+<?php
+/*
+Plugin Name: Fully Featured Payment Gateway
+Plugin URI: https://yourwebsite.com
+Description: A fully functional payment gateway plugin for WordPress and WooCommerce.
+Version: 1.0
+Author: Your Name
+Author URI: https://yourwebsite.com
+License: GPL2
+*/
+
+if (!defined('ABSPATH')) {
+    exit; // Exit if accessed directly
+}
+
+// Ensure WooCommerce is active
+if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
+    return;
+}
+
+// Initialize the gateway class
+add_action('plugins_loaded', 'init_fully_featured_payment_gateway');
+function init_fully_featured_payment_gateway() {
+    if (!class_exists('WC_Payment_Gateway')) {
+        return;
+    }
+
+    class WC_Fully_Featured_Payment_Gateway extends WC_Payment_Gateway {
+        public function __construct() {
+            $this->id                 = 'fully_featured_gateway';
+            $this->icon               = apply_filters('woocommerce_fully_featured_gateway_icon', plugins_url('assets/images/icon.png', __FILE__));
+            $this->has_fields         = true;
+            $this->method_title       = __('Fully Featured Payment Gateway', 'woocommerce');
+            $this->method_description = __('Accept payments via a fully featured gateway.', 'woocommerce');
+            $this->supports           = array('products', 'refunds', 'subscriptions', 'subscription_cancellation', 'subscription_suspension', 'subscription_reactivation');
+
+            // Load settings
+            $this->init_form_fields();
+            $this->init_settings();
+
+            // Define user settings
+            $this->title        = $this->get_option('title');
+            $this->description  = $this->get_option('description');
+            $this->enabled      = $this->get_option('enabled');
+            $this->api_key      = $this->get_option('api_key');
+            $this->test_mode    = 'yes' === $this->get_option('test_mode');
+
+            // Save settings
+            add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
+
+            // Webhook handling
+            add_action('woocommerce_api_' . $this->id, array($this, 'handle_webhook'));
+        }
+
+        // Define admin settings fields
+        public function init_form_fields() {
+            $this->form_fields = array(
+                'enabled' => array(
+                    'title'   => __('Enable/Disable', 'woocommerce'),
+                    'type'    => 'checkbox',
+                    'label'   => __('Enable Fully Featured Payment Gateway', 'woocommerce'),
+                    'default' => 'yes'
+                ),
+                'title' => array(
+                    'title'       => __('Title', 'woocommerce'),
+                    'type'        => 'text',
+                    'description' => __('The title displayed during checkout.', 'woocommerce'),
+                    'default'     => __('Fully Featured Payment', 'woocommerce'),
+                    'desc_tip'    => true,
+                ),
+                'description' => array(
+                    'title'       => __('Description', 'woocommerce'),
+                    'type'        => 'textarea',
+                    'description' => __('The description displayed during checkout.', 'woocommerce'),
+                    'default'     => __('Pay securely with your credit card or digital wallet.', 'woocommerce'),
+                ),
+                'api_key' => array(
+                    'title'       => __('API Key', 'woocommerce'),
+                    'type'        => 'text',
+                    'description' => __('Enter your Stripe API key.', 'woocommerce'),
+                    'default'     => '',
+                ),
+                'test_mode' => array(
+                    'title'       => __('Test Mode', 'woocommerce'),
+                    'type'        => 'checkbox',
+                    'label'       => __('Enable Test Mode', 'woocommerce'),
+                    'default'     => 'yes',
+                    'description' => __('Enable test mode for development.', 'woocommerce'),
+                ),
+                'accepted_cards' => array(
+                    'title'       => __('Accepted Cards', 'woocommerce'),
+                    'type'        => 'multiselect',
+                    'description' => __('Select card types to accept.', 'woocommerce'),
+                    'default'     => array('visa', 'mastercard'),
+                    'options'     => array(
+                        'visa'       => __('Visa', 'woocommerce'),
+                        'mastercard' => __('MasterCard', 'woocommerce'),
+                        'amex'       => __('American Express', 'woocommerce'),
+                        'discover'   => __('Discover', 'woocommerce'),
+                    ),
+                ),
+            );
+        }
+
+        // Display payment fields on checkout
+        public function payment_fields() {
+            if ($this->test_mode) {
+                echo '<p>' . __('TEST MODE ENABLED. Use test card details.', 'woocommerce') . '</p>';
+            }
+            echo '<fieldset>
+                <p class="form-row form-row-wide">
+                    <label for="card-number">' . __('Card Number', 'woocommerce') . ' <span class="required">*</span></label>
+                    <input id="card-number" class="input-text" type="text" maxlength="20" autocomplete="off" placeholder="•••• •••• •••• ••••" />
+                </p>
+                <p class="form-row form-row-first">
+                    <label for="card-expiry">' . __('Expiry (MM/YY)', 'woocommerce') . ' <span class="required">*</span></label>
+                    <input id="card-expiry" class="input-text" type="text" autocomplete="off" placeholder="MM / YY" />
+                </p>
+                <p class="form-row form-row-last">
+                    <label for="card-cvc">' . __('CVC', 'woocommerce') . ' <span class="required">*</span></label>
+                    <input id="card-cvc" class="input-text" type="text" autocomplete="off" placeholder="CVC" />
+                </p>
+            </fieldset>';
+        }
+
+        // Validate payment fields
+        public function validate_fields() {
+            if (empty($_POST['card-number'])) {
+                wc_add_notice(__('Card number is required.', 'woocommerce'), 'error');
+                return false;
+            }
+            if (empty($_POST['card-expiry'])) {
+                wc_add_notice(__('Card expiry is required.', 'woocommerce'), 'error');
+                return false;
+            }
+            if (empty($_POST['card-cvc'])) {
+                wc_add_notice(__('Card CVC is required.', 'woocommerce'), 'error');
+                return false;
+            }
+            return true;
+        }
+
+        // Process the payment
+        public function process_payment($order_id) {
+            $order = wc_get_order($order_id);
+
+            // Placeholder for Stripe API call
+            $response = $this->process_stripe_payment($order);
+
+            if ($response['success']) {
+                $order->payment_complete();
+                $order->add_order_note(__('Payment successful via Fully Featured Gateway. Transaction ID: ' . $response['transaction_id'], 'woocommerce'));
+                wc_reduce_stock_levels($order_id);
+                return array(
+                    'result'   => 'success',
+                    'redirect' => $this->get_return_url($order)
+                );
+            } else {
+                wc_add_notice(__('Payment error: ', 'woocommerce') . $response['message'], 'error');
+                return array(
+                    'result'   => 'failure',
+                    'redirect' => ''
+                );
+            }
+        }
+
+        // Placeholder for Stripe payment processing
+        private function process_stripe_payment($order) {
+            // Implement Stripe API integration here
+            // Example: Use Stripe PHP library to create a PaymentIntent
+            try {
+                // Set Stripe API key
+                \Stripe\Stripe::setApiKey($this->api_key);
+
+                // Create PaymentIntent
+                $payment_intent = \Stripe\PaymentIntent::create([
+                    'amount' => $order->get_total() * 100, // Amount in cents
+                    'currency' => get_woocommerce_currency(),
+                    'description' => 'Order #' . $order->get_id(),
+                    'metadata' => array(
+                        'order_id' => $order->get_id(),
+                    ),
+                ]);
+
+                return array(
+                    'success' => true,
+                    'message' => 'Payment processed successfully.',
+                    'transaction_id' => $payment_intent->id
+                );
+            } catch (\Stripe\Exception\ApiErrorException $e) {
+                return array(
+                    'success' => false,
+                    'message' => $e->getMessage()
+                );
+            }
+        }
+
+        // Handle webhooks
+        public function handle_webhook() {
+            // Implement webhook handling for Stripe events
+            // Example: Verify webhook signature and update order status
+        }
+
+        // Process refund
+        public function process_refund($order_id, $amount = null, $reason = '') {
+            $order = wc_get_order($order_id);
+
+            try {
+                \Stripe\Stripe::setApiKey($this->api_key);
+                $refund = \Stripe\Refund::create([
+                    'amount' => $amount * 100, // Amount in cents
+                    'payment_intent' => $order->get_transaction_id(),
+                ]);
+
+                $order->add_order_note(sprintf(__('Refunded %s - Refund ID: %s', 'woocommerce'), wc_price($amount), $refund->id));
+                return true;
+            } catch (\Stripe\Exception\ApiErrorException $e) {
+                $order->add_order_note(__('Refund failed: ', 'woocommerce') . $e->getMessage());
+                return new WP_Error('error', $e->getMessage());
+            }
+        }
+    }
+}
+
+// Register the gateway
+add_filter('woocommerce_payment_gateways', 'add_fully_featured_payment_gateway');
+function add_fully_featured_payment_gateway($gateways) {
+    $gateways[] = 'WC_Fully_Featured_Payment_Gateway';
+    return $gateways;
+}
+?>
